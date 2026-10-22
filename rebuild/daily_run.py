@@ -13,6 +13,7 @@
 用法：
     python3 daily_run.py --dry-run     # 只算+出页，不写线上、不推仓库
     python3 daily_run.py               # 完整跑一遍
+    python3 daily_run.py --sync-only   # 只补面板+推仓库基线+与线上页交叉校验（不写页面）
     python3 daily_run.py --date 2026-10-21
 
 注意：本脚本需要带 matplotlib 的解释器；写页面依赖资料库 skill 脚本的本地路径。
@@ -58,6 +59,9 @@ def find_skill() -> Path:
 
 
 def run(cmd, **kw):
+    # 子脚本里 --panel/--out 用的是相对路径，统一在 HERE 下执行，避免被 cron/定时器
+    # 的 cwd 影响（否则会把 latest_v2.json 写到奇怪的地方）
+    kw.setdefault("cwd", str(HERE))
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", **kw)
 
 
@@ -84,33 +88,16 @@ def backfill_and_pick() -> str:
     return max(r["date"] for r in rows)
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--date", default="")
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--skip-git", action="store_true")
-    ap.add_argument("--force", action="store_true", help="忽略已发布标记，强制重写")
-    a = ap.parse_args()
-
-    target = a.date or backfill_and_pick()
-    log(f"目标交易日 {target}")
-
-    # 已经发布过这一天就不再重复写页面（周末/节假日会出现同样的情况）
-    marker = HERE / ".last_published"
-    if marker.exists() and marker.read_text(encoding="utf-8").strip() == target \
-            and not a.force and not a.dry_run:
-        log(f"{target} 已发布过，跳过写页面（--force 可强制重写）")
-        return
-
-    # 1-3 计算
+def compute(target: str) -> dict:
+    """算读数 + 重算 CB 序列，返回 latest_v2.json 的内容。"""
     r = run([sys.executable, str(HERE / "daily_update_v2.py"), "--date", target,
-             "--out", "latest_v2.json"])
+             "--panel", str(HERE / "panel.csv"), "--out", str(HERE / "latest_v2.json")])
     if r.returncode != 0:
         print(r.stdout, r.stderr)
         raise SystemExit("计算失败（可能是非交易日或取数异常）")
     log(r.stdout.strip().splitlines()[0])
+    R = json.loads((HERE / "latest_v2.json").read_text(encoding="utf-8"))
 
-    # 序列重算
     from search_scheme import build, load_panel
     rows = load_panel(HERE / "panel.csv")
     ser = build(rows, "roll1250", 250)
@@ -121,28 +108,121 @@ def main() -> None:
             if x:
                 w.writerow({k: (round(v, 6) if isinstance(v, float) else v) for k, v in x.items()})
     log(f"CB 序列 {sum(1 for x in ser if x)} 天")
+    return R
+
+
+ANCHORS = ("便宜度分位（BM 中位数）", "触发测算", "五、历史信号")
+
+
+def fetch_live(skill: Path, dest: Path) -> str:
+    """把线上当前页抓到本地，返回 HTML 文本；结构不符则抛异常。"""
+    out = run([sys.executable, str(skill / "page" / "download_page_artifacts.py"),
+               "--node-id", NODE_ID, "--list-only"])
+    payload = out.stdout[out.stdout.find("{"):]
+    j = json.loads(payload)
+    if "artifacts" in j:
+        entry = [x["path"].lstrip("/") for x in j["artifacts"] if x["path"].lower().endswith(".html")][0]
+    else:  # CLI 输出形态：entry_html / files
+        entry = j.get("entry_html") or (j.get("files") or [None])[0]
+        if not entry:
+            raise ValueError("找不到入口 HTML")
+    url = urllib.parse.urljoin(j["url"], urllib.parse.quote(entry))
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}),
+                                timeout=60) as resp:
+        dest.write_bytes(resp.read())
+    txt = dest.read_text(encoding="utf-8")
+    if not all(k in txt for k in ANCHORS):
+        raise ValueError("线上页结构不符")
+    return txt
+
+
+def page_state(txt: str) -> dict:
+    """从页面 HTML 里抠出「数据更新日期 / hero CB / hero 信号」。"""
+    d = re.search(r"数据更新：\s*<b[^>]*>(?:<!--pnid:[^>]*-->)?([\d-]+)</b>", txt)
+    c = re.search(r'<div[^>]*class="big"[^>]*>(?:<!--pnid:[^>]*-->)?([\d.]+)</div>', txt)
+    s = re.search(r'<div[^>]*class="sig"[^>]*>(?:<!--pnid:[^>]*-->)?([^<]{1,12})</div>', txt)
+    return {"date": d.group(1) if d else None,
+            "cb": float(c.group(1)) if c else None,
+            "signal": (s.group(1).strip() if s else None)}
+
+
+def git_sync(target: str) -> str:
+    """把面板/序列/读数提交并推仓库，返回 'pushed' / 'nochange' / 'failed:<msg>'。"""
+    if not (REPO / ".git").exists():
+        return "nochange"
+    dst_dir = REPO / "rebuild"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for f in ("panel.csv", "cb_series_v2.csv", "latest_v2.json"):
+        shutil.copy(HERE / f, dst_dir / f)
+    run(["git", "-C", str(REPO), "add", "rebuild/panel.csv", "rebuild/cb_series_v2.csv",
+         "rebuild/latest_v2.json"])
+    r = run(["git", "-C", str(REPO), "-c", "user.name=mathskit-pure",
+             "-c", "user.email=mathskit-pure@users.noreply.github.com",
+             "commit", "-q", "-m", f"data(v2): {target} 日更（面板/序列/读数）"])
+    if r.returncode != 0:
+        return "nochange"
+    env = dict(os.environ, GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519_afgi -o IdentitiesOnly=yes")
+    rr = run(["git", "-C", str(REPO), "push", "-q", "origin", "main"], env=env)
+    if rr.returncode == 0:
+        return "pushed"
+    return "failed:" + (rr.stderr or rr.stdout)[:200]
+
+
+def sync_only(target: str) -> int:
+    """周同步：补齐面板 → 推仓库基线 → 与线上页交叉校验（不写页面）。"""
+    R = compute(target)
+    st = git_sync(target)
+    log(f"仓库：{st}")
+
+    skill = find_skill()
+    try:
+        txt = fetch_live(skill, HERE / "_live_base.html")
+        ps = page_state(txt)
+    except Exception as e:
+        log(f"线上页读取失败：{e}")
+        return 5
+
+    same_day = ps["date"] == R["trade_date"]
+    dcb = None if ps["cb"] is None else round(R["cb"] - ps["cb"], 4)
+    ok = same_day and dcb is not None and abs(dcb) <= 0.005
+    log(f"读数 CB {R['cb']:.3f}（BM {R['bm_percentile']:.3f} / PB {R['pb_percentile']:.3f}）")
+    log(f"线上页 日期 {ps['date']} / CB {ps['cb']} / {ps['signal']}")
+    log("交叉校验：一致" if ok else
+        f"交叉校验：**不一致**（日期{'同' if same_day else '异'}，CB 差 {dcb}）→ 需人工看一眼")
+    return 0 if ok else 3
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--date", default="")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--skip-git", action="store_true")
+    ap.add_argument("--force", action="store_true", help="忽略已发布标记，强制重写")
+    ap.add_argument("--sync-only", action="store_true",
+                    help="只补面板+推仓库基线+与线上页交叉校验，不写页面（本机周同步用）")
+    a = ap.parse_args()
+
+    target = a.date or backfill_and_pick()
+    log(f"目标交易日 {target}")
+
+    if a.sync_only:
+        raise SystemExit(sync_only(target))
+
+    # 已经发布过这一天就不再重复写页面（周末/节假日会出现同样的情况）
+    marker = HERE / ".last_published"
+    if marker.exists() and marker.read_text(encoding="utf-8").strip() == target \
+            and not a.force and not a.dry_run:
+        log(f"{target} 已发布过，跳过写页面（--force 可强制重写）")
+        return
+
+    # 1-3 计算
+    R = compute(target)
 
     # 4 出页：优先以线上页为底
     skill = find_skill()
     base = HERE / "_live_base.html"
     try:
-        out = run([sys.executable, str(skill / "page" / "download_page_artifacts.py"),
-                   "--node-id", NODE_ID, "--list-only"])
-        payload = out.stdout[out.stdout.find("{"):]
-        j = json.loads(payload)
-        if "artifacts" in j:
-            entry = [x["path"].lstrip("/") for x in j["artifacts"] if x["path"].lower().endswith(".html")][0]
-        else:  # CLI 输出形态：entry_html / files
-            entry = j.get("entry_html") or (j.get("files") or [None])[0]
-            if not entry:
-                raise ValueError("找不到入口 HTML")
-        url = urllib.parse.urljoin(j["url"], urllib.parse.quote(entry))
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}),
-                                    timeout=60) as resp:
-            base.write_bytes(resp.read())
-        txt = base.read_text(encoding="utf-8")
-        if not all(k in txt for k in ("便宜度分位（BM 中位数）", "触发测算", "五、历史信号")):
-            raise ValueError("线上页结构不符")
+        txt = fetch_live(skill, base)
         log(f"基底 = 线上当前页（{len(txt)} 字符）")
     except Exception as e:
         for cand in (HERE.parent / "bscore_patch" / "template_v23.html",
@@ -187,23 +267,8 @@ def main() -> None:
     (HERE / ".last_published").write_text(target, encoding="utf-8")
 
     # 6 状态入 git
-    if not a.skip_git and (REPO / ".git").exists():
-        dst_dir = REPO / "rebuild"
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        for f in ("panel.csv", "cb_series_v2.csv", "latest_v2.json"):
-            shutil.copy(HERE / f, dst_dir / f)
-        run(["git", "-C", str(REPO), "add", "rebuild/panel.csv", "rebuild/cb_series_v2.csv",
-             "rebuild/latest_v2.json"])
-        r = run(["git", "-C", str(REPO), "-c", "user.name=mathskit-pure",
-                 "-c", "user.email=mathskit-pure@users.noreply.github.com",
-                 "commit", "-q", "-m", f"data(v2): {target} 日更（面板/序列/读数）"])
-        ok = r.returncode == 0
-        if ok:
-            env = dict(os.environ, GIT_SSH_COMMAND="ssh -i ~/.ssh/id_ed25519_afgi -o IdentitiesOnly=yes")
-            rr = run(["git", "-C", str(REPO), "push", "-q", "origin", "main"], env=env)
-            log("状态已推送 GitHub" if rr.returncode == 0 else f"推送失败：{rr.stderr[:150]}")
-        else:
-            log("无变化，未提交")
+    if not a.skip_git:
+        log(f"仓库：{git_sync(target)}")
 
 
 if __name__ == "__main__":
