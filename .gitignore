@@ -1,0 +1,17 @@
+# 大体积行情缓存与中间产物，不进仓库（云端重建时自行下载）
+*.csv.gz
+*.parquet
+prices_*.csv
+ohlc*.csv
+bench_*.csv
+*.log
+*.pyc
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+# 本地临时产物
+report/dashboard.html
+_run/
+_backup/

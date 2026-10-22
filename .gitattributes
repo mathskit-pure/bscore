@@ -1,0 +1,7 @@
+# 统一换行：仓库内一律 LF（云端 Linux 直接执行）
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.csv -text
+*.tar.gz binary
+*.png binary
