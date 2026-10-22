@@ -89,10 +89,18 @@ def main() -> None:
     ap.add_argument("--date", default="")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--skip-git", action="store_true")
+    ap.add_argument("--force", action="store_true", help="忽略已发布标记，强制重写")
     a = ap.parse_args()
 
     target = a.date or backfill_and_pick()
     log(f"目标交易日 {target}")
+
+    # 已经发布过这一天就不再重复写页面（周末/节假日会出现同样的情况）
+    marker = HERE / ".last_published"
+    if marker.exists() and marker.read_text(encoding="utf-8").strip() == target \
+            and not a.force and not a.dry_run:
+        log(f"{target} 已发布过，跳过写页面（--force 可强制重写）")
+        return
 
     # 1-3 计算
     r = run([sys.executable, str(HERE / "daily_update_v2.py"), "--date", target,
@@ -176,6 +184,7 @@ def main() -> None:
     log(f"已提交 v{m.group(1) if m else '?'}")
     r = run([sys.executable, str(skill / "page" / "publish_page.py"), "--node-id", NODE_ID])
     log("已同步发布态" if r.returncode == 0 else f"发布失败：{r.stderr[:200]}")
+    (HERE / ".last_published").write_text(target, encoding="utf-8")
 
     # 6 状态入 git
     if not a.skip_git and (REPO / ".git").exists():
