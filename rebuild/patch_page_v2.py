@@ -24,7 +24,11 @@ import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bscore_patch"))
+_HERE = Path(__file__).resolve().parent
+for _cand in (_HERE.parent / "bscore_patch", _HERE.parent / "tools", _HERE):
+    if (_cand / "patch_v23.py").is_file():
+        sys.path.insert(0, str(_cand))
+        break
 import patch_v23 as P  # noqa: E402
 
 T_BUILD, T_FULL = 0.85, 0.92

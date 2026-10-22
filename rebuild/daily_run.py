@@ -61,18 +61,26 @@ def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", **kw)
 
 
-def latest_trade_date() -> str:
-    """优先用今天；今天不是交易日就用面板最后一天。"""
+def backfill_and_pick() -> str:
+    """把面板从「最后一行的次日」补到今天（幂等），返回面板最新交易日。
+
+    这样处理两种情况：正常日更只补 1 天；沙箱被清空后从仓库带来的 panel.csv
+    会一次补齐中间所有缺失的工作日，无需人工干预。
+    """
     import datetime as dt
+
+    panel = HERE / "panel.csv"
+    rows = list(csv.DictReader(panel.open(encoding="utf-8"))) if panel.exists() else []
+    last = max((r["date"] for r in rows), default="2018-01-01")
+    start = (dt.date.fromisoformat(last) + dt.timedelta(days=1)).isoformat()
     today = dt.date.today().isoformat()
-    r = run([sys.executable, str(HERE / "build_panel.py"), "--start", today, "--end", today,
-             "--out", "_probe_today.csv", "--workers", "1"])
-    if Path(HERE / "_probe_today.csv").exists():
-        rows = list(csv.DictReader((HERE / "_probe_today.csv").open(encoding="utf-8")))
-        (HERE / "_probe_today.csv").unlink()
-        if rows:
-            return today
-    rows = list(csv.DictReader((HERE / "panel.csv").open(encoding="utf-8")))
+    if start <= today:
+        log(f"补采 {start} → {today}")
+        run([sys.executable, str(HERE / "build_panel.py"), "--start", start, "--end", today,
+             "--out", "panel.csv", "--workers", "6"])
+    rows = list(csv.DictReader(panel.open(encoding="utf-8")))
+    if not rows:
+        raise SystemExit("面板为空，无法计算")
     return max(r["date"] for r in rows)
 
 
@@ -83,12 +91,12 @@ def main() -> None:
     ap.add_argument("--skip-git", action="store_true")
     a = ap.parse_args()
 
-    target = a.date or latest_trade_date()
+    target = a.date or backfill_and_pick()
     log(f"目标交易日 {target}")
 
     # 1-3 计算
     r = run([sys.executable, str(HERE / "daily_update_v2.py"), "--date", target,
-             "--refresh", "--out", "latest_v2.json"])
+             "--out", "latest_v2.json"])
     if r.returncode != 0:
         print(r.stdout, r.stderr)
         raise SystemExit("计算失败（可能是非交易日或取数异常）")
@@ -129,7 +137,11 @@ def main() -> None:
             raise ValueError("线上页结构不符")
         log(f"基底 = 线上当前页（{len(txt)} 字符）")
     except Exception as e:
-        base = HERE.parent / "bscore_patch" / "template_v23.html"
+        for cand in (HERE.parent / "bscore_patch" / "template_v23.html",
+                     HERE.parent / "tools" / "template_v23.html"):
+            if cand.is_file():
+                base = cand
+                break
         log(f"取线上页失败（{e}），回退模板")
 
     r = run([sys.executable, str(HERE / "patch_page_v2.py"), "--template", str(base),
