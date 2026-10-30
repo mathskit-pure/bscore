@@ -299,6 +299,9 @@ def main() -> None:
         "标的池、BM 中位数、全市场 PB、破净率等口径已按旧页读数逐项校准，误差均在 0.5% 内。"
         "</div><!--V2_NOTE_END-->"
     )
+    # 基底通常是「线上当前页」，里面已经带着上一轮插入的口径说明；
+    # 不先摘掉就会每跑一次追加一条，页面越跑越长。
+    html = re.sub(r"<!--V2_NOTE_START-->.*?<!--V2_NOTE_END-->\s*", "", html, flags=re.S)
     m = re.search(r'<div[^>]*class="sub"[^>]*>(?:(?!</div>).)*?</div>\s*', html, re.S)
     if m:
         html = html[:m.end()] + note + "\n" + html[m.end():]
